@@ -124,7 +124,6 @@ public:
     kv_master(const group& arg_topic)
         : topic(arg_topic)
         {
-        join(topic);
         serving = (
         // Update Messages
         on(atom("update"), arg_match) >> [=](key_type& key, val_type& val)
