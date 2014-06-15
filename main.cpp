@@ -13,6 +13,61 @@ using namespace cppa;
 using val_type = int;
 using key_type = string;
 
+class kv_sequence {
+public:
+
+    kv_sequence next() const
+        {
+        kv_sequence rval = *this;
+        vector<uint64_t>& n = rval.sequence;
+
+        for ( int i = n.size() - 1; i >= 0; --i )
+            {
+            ++n[i];
+
+            if ( n[i] != 0 )
+                break;
+
+            if ( i == 0 )
+                n.insert(n.begin(), 1);
+            }
+
+        return rval;
+        }
+
+    kv_sequence& operator++()
+        {
+        sequence = move(next().sequence);
+        return *this;
+        }
+
+    kv_sequence operator++(int)
+        {
+        kv_sequence tmp = *this;
+        operator++();
+        return tmp;
+        }
+
+    vector<uint64_t> sequence = { 0 };
+};
+
+inline bool operator==(const kv_sequence& lhs, const kv_sequence& rhs)
+    { return lhs.sequence == rhs.sequence; }
+inline bool operator!=(const kv_sequence& lhs, const kv_sequence& rhs)
+    { return ! operator==(lhs,rhs); }
+inline bool operator<(const kv_sequence& lhs, const kv_sequence& rhs)
+    {
+    if ( lhs.sequence.size() == rhs.sequence.size() )
+        return lhs.sequence < rhs.sequence;
+    return lhs.sequence.size() < rhs.sequence.size();
+    }
+inline bool operator>(const kv_sequence& lhs, const kv_sequence& rhs)
+    { return operator<(rhs,lhs); }
+inline bool operator<=(const kv_sequence& lhs, const kv_sequence& rhs)
+    { return ! operator>(lhs,rhs); }
+inline bool operator>=(const kv_sequence& lhs, const kv_sequence& rhs)
+    { return ! operator<(lhs,rhs); }
+
 class kv_store {
 public:
 
@@ -34,17 +89,15 @@ public:
         store.clear();
         }
 
-    uint64_t nextseq() const
-        { return sequence + 1; }
+    kv_sequence nextseq() const
+        { return sequence.next(); }
 
     map<key_type, val_type> store;
-    uint64_t sequence;
+    kv_sequence sequence;
 };
 
-bool operator==(const kv_store& lhs, const kv_store& rhs)
-    {
-    return lhs.sequence == rhs.sequence && lhs.store == rhs.store;
-    }
+inline bool operator==(const kv_store& lhs, const kv_store& rhs)
+    { return lhs.sequence == rhs.sequence && lhs.store == rhs.store; }
 
 static void dbg_dump(const actor& a, const string& store_id,
                      const kv_store& store)
@@ -159,29 +212,35 @@ public:
         );
         synchronized = (
         // Update Messages
-        on(atom("update"), arg_match) >> [=](uint64_t seq, key_type& key,
+        on(atom("update"), arg_match) >> [=](kv_sequence& seq, key_type& key,
                                              val_type& val)
             {
-            if ( seq == store.nextseq() )
+            kv_sequence next = store.nextseq();
+
+            if ( seq == next )
                 {
                 store.update(key, val);
                 dbg_dump(this, idstr(), store);
                 }
-            else
+            else if ( seq > next )
                 out_of_sync();
             },
-        on(atom("remove"), arg_match) >> [=](uint64_t seq, key_type& key)
+        on(atom("remove"), arg_match) >> [=](kv_sequence& seq, key_type& key)
             {
-            if ( seq == store.nextseq() )
+            kv_sequence next = store.nextseq();
+
+            if ( seq == next )
                 store.remove(key);
-            else
+            else if ( seq > next )
                 out_of_sync();
             },
-        on(atom("clear"), arg_match) >> [=](uint64_t seq)
+        on(atom("clear"), arg_match) >> [=](kv_sequence& seq)
             {
-            if ( seq == store.nextseq() )
+            kv_sequence next = store.nextseq();
+
+            if ( seq == next )
                 store.clear();
-            else
+            else if ( seq > next )
                 out_of_sync();
             },
         // Request Messages
@@ -214,6 +273,7 @@ private:
 
     void out_of_sync()
         {
+        // TODO: should never be able to get in to this state?
         aout(this) << "ERROR: " << idstr() << " out of sync." << endl;
         synchronize();
         }
@@ -342,6 +402,7 @@ enum KVmode {
 
 int main(int argc, char** argv)
     {
+    announce<kv_sequence>(&kv_sequence::sequence);
     announce<kv_store>(&kv_store::store, &kv_store::sequence);
     KVmode mode = KV_MODE_MASTER;
     string portstr = "9999";
