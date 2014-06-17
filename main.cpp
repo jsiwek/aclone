@@ -3,6 +3,7 @@
 #include <sstream>
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <getopt.h>
 
 #include <cppa/cppa.hpp>
@@ -121,30 +122,37 @@ friend class sb_actor<kv_master>;
 
 public:
 
-    kv_master(const group& arg_topic)
-        : topic(arg_topic)
+    kv_master()
         {
         serving = (
         // Update Messages
         on(atom("update"), arg_match) >> [=](key_type& key, val_type& val)
             {
             store.update(key, val);
-            send(topic, atom("update"), store.sequence, key, val);
+            publish(make_cow_tuple(atom("update"), store.sequence, key, val));
             dbg_dump(this, idstr(), store);
             },
         on(atom("remove"), arg_match) >> [=](key_type& key)
             {
             store.remove(key);
-            send(topic, atom("remove"), store.sequence, key);
+            publish(make_cow_tuple(atom("remove"), store.sequence, key));
             },
         on(atom("clear")) >> [=]()
             {
             store.clear();
-            send(topic, atom("clear"), store.sequence);
+            publish(make_cow_tuple(atom("clear"), store.sequence));
             },
         // Request Messages
-        on(atom("snapshot")) >> [=]()
+        on(atom("snapshot"), arg_match) >> [=](actor& sender)
             {
+            auto sender_addr = last_sender();
+
+            if ( subscribers.find(sender_addr) == subscribers.end() )
+                {
+                monitor(sender_addr);
+                subscribers[sender_addr] = sender;
+                }
+
             return make_cow_tuple(store);
             },
         on(atom("lookup"), arg_match) >> [=](key_type& key)
@@ -162,11 +170,22 @@ public:
         on(atom("size")) >> [=]()
             {
             return make_cow_tuple(store.store.size());
+            },
+        on_arg_match >> [=](down_msg& d)
+            {
+            auto sender_addr = last_sender();
+            demonitor(sender_addr);
+            subscribers.erase(sender_addr);
             }
         );
         }
 
 private:
+
+    void publish(any_tuple&& msg)
+        {
+        for ( auto s : subscribers ) send_tuple(s.second, msg);
+        }
 
     string idstr() const
         {
@@ -176,7 +195,7 @@ private:
         }
 
     kv_store store;
-    group topic;
+    unordered_map<actor_addr, actor> subscribers;
     behavior serving;
     behavior& init_state = serving;
 };
@@ -186,27 +205,46 @@ friend class sb_actor<kv_cloner>;
 
 public:
 
-    kv_cloner(const actor& master, const group& topic)
+    kv_cloner(const string& addr, uint16_t port)
         {
-        join(topic);
-        // TODO: implement a reconnection behavior
+        try_connect(addr, port);
+
         bootstrap = (
         after(chrono::seconds(0)) >> [=]()
             {
-            synchronize();
+            if ( ! master )
+                reconnect();
+            else
+                synchronize();
             }
         );
         synchronizing = (
         on(atom("sync")) >> [=]()
             {
-            sync_send(master, atom("snapshot")).then(
+            sync_send(master, atom("snapshot"), this).then(
                 on_arg_match >> [=](kv_store& sto)
                     {
                     store = sto;
                     become(synchronized);
                     aout(this) << "INFO: " << idstr() << " sync'd." << endl;
+                    },
+                on_arg_match >> [=](down_msg& d)
+                    {
+                    aout(this) << "WARN: lost connection to kv_master" << endl;
+                    demonitor(master);
+                    master = invalid_actor;
+                    reconnect();
                     }
             );
+            }
+        );
+        disconnected = (
+        on(atom("reconnect")) >> [=]()
+            {
+            if ( try_connect(addr, port) )
+                synchronize();
+            else
+                reconnect();
             }
         );
         synchronized = (
@@ -258,11 +296,44 @@ public:
         on(atom("size")) >> [=]()
             {
             return make_cow_tuple(store.store.size());
+            },
+        on_arg_match >> [=](down_msg& d)
+            {
+            aout(this) << "WARN: lost connection to kv_master" << endl;
+            demonitor(master);
+            master = invalid_actor;
+            reconnect();
             }
         );
         }
 
 private:
+
+    bool try_connect(const string& addr, uint16_t port)
+        {
+        try
+            {
+            master = remote_actor(addr, port);
+            monitor(master);
+            aout(this) << "INFO: connected to kv_master: " << addr << ":"
+                       << port << endl;
+            return true;
+            }
+        catch ( exception& e)
+            {
+            aout(this) << "WARN: failed to connect to kv_master: " << e.what()
+                       << ", will retry in 3s." << endl;
+            }
+
+        master = invalid_actor;
+        return false;
+        }
+
+    void reconnect()
+        {
+        become(disconnected);
+        delayed_send(this, chrono::seconds(3), atom("reconnect"));
+        }
 
     void synchronize()
         {
@@ -285,7 +356,9 @@ private:
         }
 
     kv_store store;
+    actor master = invalid_actor;
     behavior bootstrap;
+    behavior disconnected;
     behavior synchronizing;
     behavior synchronized;
     behavior& init_state = bootstrap;
@@ -375,7 +448,6 @@ static void usage(const string& program)
     fprintf(stderr, "    -u|--updater     | sends updates periodically\n");
     fprintf(stderr, "    -k|--key         | key to update/request\n");
     fprintf(stderr, "    -f|--freq        | frequency to update/request\n");
-    fprintf(stderr, "    -t|--topic       | topic/group name\n");
     }
 
 static option long_options[] = {
@@ -387,10 +459,9 @@ static option long_options[] = {
     {"updater",      no_argument,          0, 'u'},
     {"key",          required_argument,    0, 'k'},
     {"freq",         required_argument,    0, 'f'},
-    {"topic",        required_argument,    0, 't'},
 };
 
-static const char* opt_string = "p:a:k:f:t:mcru";
+static const char* opt_string = "p:a:k:f:mcru";
 
 enum KVmode {
     KV_MODE_MASTER,
@@ -407,7 +478,6 @@ int main(int argc, char** argv)
     string portstr = "9999";
     string key = "bogus";
     string freqstr = "1";
-    string topic = "test";
     string addr = "127.0.0.1";
 
     for ( ; ; )
@@ -442,9 +512,6 @@ int main(int argc, char** argv)
         case 'f':
             freqstr = optarg;
             break;
-        case 't':
-            topic = optarg;
-            break;
         default:
             usage(argv[0]);
             return 1;
@@ -457,19 +524,13 @@ int main(int argc, char** argv)
     switch ( mode ) {
     case KV_MODE_MASTER:
         {
-        auto grp = group::get("local", topic);
-        auto master = spawn<kv_master>(grp);
+        auto master = spawn<kv_master>();
         publish(master, port, addr.c_str());
-        publish_local_groups(port + 1, addr.c_str());
         }
         break;
     case KV_MODE_CLONER:
         {
-        stringstream groupid;
-        groupid << topic << "@" << addr << ":" << port + 1;
-        auto remote = remote_actor(addr, port);
-        auto grp = group::get("remote", groupid.str());
-        spawn<kv_cloner>(remote, grp);
+        spawn<kv_cloner>(addr, port);
         }
         break;
     case KV_MODE_REQUESTER:
