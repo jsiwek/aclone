@@ -5,6 +5,7 @@ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 find_package(libcppa REQUIRED)
 
 include_directories(BEFORE ${LIBCPPA_INCLUDE_DIR})
+include_directories(BEFORE ${PROJECT_SOURCE_DIR})
 
 if ( NOT CMAKE_BUILD_TYPE )
     message(STATUS "Defaulting to 'RelWithDebInfo' build configuration.")
@@ -17,7 +18,8 @@ set(CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG} -DDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DDEBUG")
 
 add_executable(aclone
-               main.cpp
+               src/aclone.cpp
+               src/main.cpp
 )
 target_link_libraries(aclone ${LIBCPPA_LIBRARY})
 
